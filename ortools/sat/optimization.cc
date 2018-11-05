@@ -1409,7 +1409,7 @@ SatSolver::Status MinimizeWithCoreAndLazyEncoding(
   // TODO(user): The core is returned in the same order as the assumptions,
   // so we don't really need this map, we could just do a linear scan to
   // recover which node are part of the core.
-  std::map<LiteralIndex, int> assumption_to_term_index;
+  std::map<LiteralIndex, int> literal_to_term_index;
 
   // Start the algorithm.
   int max_depth = 0;
@@ -1588,12 +1588,15 @@ SatSolver::Status MinimizeWithCoreAndLazyEncoding(
 
     // Convert integer_assumptions to Literals.
     std::vector<Literal> assumptions;
-    assumption_to_term_index.clear();
+    literal_to_term_index.clear();
     for (int i = 0; i < integer_assumptions.size(); ++i) {
       assumptions.push_back(integer_encoder->GetOrCreateAssociatedLiteral(
           integer_assumptions[i]));
-      gtl::InsertOrDie(&assumption_to_term_index, assumptions.back().Index(),
-                       term_indices[i]);
+
+      // Tricky: In some rare case, it is possible that the same literal
+      // correspond to more that one assumptions. In this case, we can just
+      // pick one of them when converting back a core to term indices.
+      literal_to_term_index[assumptions.back().Index()] = term_indices[i];
     }
 
     // Solve under the assumptions.
@@ -1630,7 +1633,7 @@ SatSolver::Status MinimizeWithCoreAndLazyEncoding(
       IntegerValue new_var_ub(0);
       int new_depth = 0;
       for (const Literal lit : core) {
-        const int index = gtl::FindOrDie(assumption_to_term_index, lit.Index());
+        const int index = gtl::FindOrDie(literal_to_term_index, lit.Index());
         min_weight = std::min(min_weight, terms[index].weight);
         max_weight = std::max(max_weight, terms[index].weight);
         new_depth = std::max(new_depth, terms[index].depth + 1);
@@ -1667,8 +1670,7 @@ SatSolver::Status MinimizeWithCoreAndLazyEncoding(
         std::vector<IntegerVariable> constraint_vars;
         std::vector<int64> constraint_coeffs;
         for (const Literal lit : core) {
-          const int index =
-              gtl::FindOrDie(assumption_to_term_index, lit.Index());
+          const int index = gtl::FindOrDie(literal_to_term_index, lit.Index());
           terms[index].weight -= min_weight;
           constraint_vars.push_back(terms[index].var);
           constraint_coeffs.push_back(1);

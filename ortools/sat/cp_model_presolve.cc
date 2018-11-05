@@ -32,9 +32,12 @@
 #include "ortools/base/logging.h"
 #include "ortools/base/map_util.h"
 #include "ortools/base/stl_util.h"
+#include "ortools/port/proto_utils.h"
 #include "ortools/sat/cp_model_checker.h"
+#include "ortools/sat/cp_model_loader.h"
 #include "ortools/sat/cp_model_objective.h"
 #include "ortools/sat/cp_model_utils.h"
+#include "ortools/sat/probing.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/simplification.h"
@@ -63,14 +66,14 @@ struct PresolveContext {
     if (RefIsPositive(lit)) {
       return domains[lit].Min() == 1ll;
     } else {
-      return domains[PositiveRef(lit)].Min() == 0ll;
+      return domains[PositiveRef(lit)].Max() == 0ll;
     }
   }
 
   bool LiteralIsFalse(int lit) const {
     if (!IsFixed(lit)) return false;
     if (RefIsPositive(lit)) {
-      return domains[lit].Min() == 0ll;
+      return domains[lit].Max() == 0ll;
     } else {
       return domains[PositiveRef(lit)].Min() == 1ll;
     }
@@ -134,12 +137,45 @@ struct PresolveContext {
 
   void UpdateRuleStats(const std::string& name) { stats_by_rule_name[name]++; }
 
+  // Update the constraints <-> variables graph. This needs to be called each
+  // time a constraint is modified.
   void UpdateConstraintVariableUsage(int c) {
-    if (c >= constraint_to_vars.size()) constraint_to_vars.resize(c + 1);
+    CHECK_EQ(constraint_to_vars.size(), working_model->constraints_size());
     const ConstraintProto& ct = working_model->constraints(c);
     for (const int v : constraint_to_vars[c]) var_to_constraints[v].erase(c);
     constraint_to_vars[c] = UsedVariables(ct);
     for (const int v : constraint_to_vars[c]) var_to_constraints[v].insert(c);
+  }
+
+  // Calls UpdateConstraintVariableUsage() on all newly created constraints.
+  void UpdateNewConstraintsVariableUsage() {
+    const int old_size = constraint_to_vars.size();
+    const int new_size = working_model->constraints_size();
+    CHECK_LE(old_size, new_size);
+    constraint_to_vars.resize(new_size);
+    for (int c = old_size; c < new_size; ++c) {
+      constraint_to_vars[c] = UsedVariables(working_model->constraints(c));
+      for (const int v : constraint_to_vars[c]) var_to_constraints[v].insert(c);
+    }
+  }
+
+  // Returns true if our current constraints <-> variables graph is ok.
+  // This is meant to be used in DEBUG mode only.
+  bool ConstraintVariableUsageIsConsistent() {
+    if (is_unsat) return true;
+    if (constraint_to_vars.size() != working_model->constraints_size()) {
+      LOG(INFO) << "Wrong constraint_to_vars size!";
+      return false;
+    }
+    for (int c = 0; c < constraint_to_vars.size(); ++c) {
+      if (constraint_to_vars[c] !=
+          UsedVariables(working_model->constraints(c))) {
+        LOG(INFO) << "Wrong variables usage for constraint: \n"
+                  << ProtobufDebugString(working_model->constraints(c));
+        return false;
+      }
+    }
+    return true;
   }
 
   // Regroups fixed variables with the same value.
@@ -198,10 +234,6 @@ struct PresolveContext {
     }
   }
 
-  // Because we always replace equivalent literals before preprocessing a
-  // constraint, we should never run into a case where one of the literals is
-  // fixed but the other is not updated. So this can be called without the need
-  // to keep around the constraints that detected this relation.
   void AddBooleanEqualityRelation(int ref_a, int ref_b) {
     if (ref_a == ref_b) return;
     if (ref_a == NegatedRef(ref_b)) {
@@ -218,10 +250,36 @@ struct PresolveContext {
       added |= affine_relations.TryAdd(PositiveRef(ref_a), PositiveRef(ref_b),
                                        -1, 1);
     }
-    if (added) {
-      modified_domains.Set(PositiveRef(ref_a));
-      modified_domains.Set(PositiveRef(ref_b));
+    if (!added) return;
+
+    modified_domains.Set(PositiveRef(ref_a));
+    modified_domains.Set(PositiveRef(ref_b));
+
+    // For now, we do need to add the relation ref_a == ref_b so we have a
+    // proper variable usage count and propagation between ref_a and ref_b.
+    //
+    // TODO(user): This looks unclean. We should probably handle the affine
+    // relation together without the need of keep all the constraints that
+    // define them around.
+    ConstraintProto* ct = working_model->add_constraints();
+    auto* arg = ct->mutable_linear();
+    arg->add_vars(PositiveRef(ref_a));
+    arg->add_vars(PositiveRef(ref_b));
+    if (RefIsPositive(ref_a) == RefIsPositive(ref_b)) {
+      // a = b
+      arg->add_coeffs(1);
+      arg->add_coeffs(-1);
+      arg->add_domain(0);
+      arg->add_domain(0);
+    } else {
+      // a = 1 - b
+      arg->add_coeffs(1);
+      arg->add_coeffs(1);
+      arg->add_domain(1);
+      arg->add_domain(1);
     }
+    affine_constraints.insert(ct);
+    UpdateNewConstraintsVariableUsage();
   }
 
   // This makes sure that the affine relation only uses one of the
@@ -1784,7 +1842,85 @@ void ExtractClauses(const ClauseContainer& container, CpModelProto* proto) {
   }
 }
 
+void Probe(PresolveContext* context) {
+  if (context->is_unsat) return;
+
+  // Update the domain in the current CpModelProto.
+  for (int i = 0; i < context->working_model->variables_size(); ++i) {
+    FillDomainInProto(context->DomainOf(i),
+                      context->working_model->mutable_variables(i));
+  }
+  const CpModelProto& model_proto = *(context->working_model);
+
+  // Load the constraints in a local model.
+  //
+  // TODO(user): remove code duplication with cp_mode_solver. Here we also do
+  // not run the heuristic to decide which variable to fully encode.
+  //
+  // TODO(user): Maybe do not load slow to propagate constraints? for instance
+  // we do not use any linear relaxation here.
+  Model model;
+  auto* encoder = model.GetOrCreate<IntegerEncoder>();
+  encoder->DisableImplicationBetweenLiteral();
+  ModelWithMapping m(model_proto, &model);
+  m.DetectOptionalVariables(model_proto);
+  m.ExtractEncoding(model_proto);
+  for (const ConstraintProto& ct : model_proto.constraints()) {
+    if (m.ConstraintIsAlreadyLoaded(&ct)) continue;
+    CHECK(LoadConstraint(ct, &m));
+  }
+  encoder->AddAllImplicationsBetweenAssociatedLiterals();
+  auto* sat_solver = model.GetOrCreate<SatSolver>();
+  sat_solver->Propagate();
+
+  // Probe.
+  //
+  // TODO(user): Compute the transitive reduction instead of just the
+  // equivalences, and use the newly learned binary clauses?
+  auto* implication_graph = model.GetOrCreate<BinaryImplicationGraph>();
+  ProbeBooleanVariables(/*deterministic_time_limit=*/1.0, &model);
+  if (sat_solver->IsModelUnsat() || !implication_graph->DetectEquivalences()) {
+    context->is_unsat = true;
+    return;
+  }
+
+  // Update the presolve context with fixed Boolean variables.
+  for (int i = 0; i < sat_solver->LiteralTrail().Index(); ++i) {
+    const Literal l = sat_solver->LiteralTrail()[i];
+    const int var = m.GetProtoVariableFromBooleanVariable(l.Variable());
+    if (var >= 0) {
+      const int ref = l.IsPositive() ? var : NegatedRef(var);
+      context->SetLiteralToTrue(ref);
+    }
+  }
+
+  const int num_variables = context->working_model->variables().size();
+  auto* integer_trail = model.GetOrCreate<IntegerTrail>();
+  for (int var = 0; var < num_variables; ++var) {
+    // Restrict IntegerVariable domain.
+    // Note that Boolean are already dealt with above.
+    if (!m.IsBoolean(var)) {
+      const Domain new_domain =
+          integer_trail->InitialVariableDomain(m.Integer(var));
+      context->IntersectDomainWith(var, new_domain);
+      continue;
+    }
+
+    // Add Boolean equivalence relations.
+    const Literal l = m.Literal(var);
+    const Literal r = implication_graph->RepresentativeOf(l);
+    if (r != l) {
+      const int r_var = m.GetProtoVariableFromBooleanVariable(r.Variable());
+      CHECK_GE(r_var, 0);
+      context->AddBooleanEqualityRelation(
+          var, r.IsPositive() ? r_var : NegatedRef(r_var));
+    }
+  }
+}
+
 void PresolvePureSatPart(PresolveContext* context) {
+  if (context->is_unsat) return;
+
   const int num_variables = context->working_model->variables_size();
   SatPostsolver postsolver(num_variables);
   SatPresolver presolver(&postsolver);
@@ -1900,14 +2036,10 @@ void PresolvePureSatPart(PresolveContext* context) {
   }
 
   // Add the presolver clauses back into the model.
-  const int old_ct_index = context->working_model->constraints_size();
   ExtractClauses(presolver, context->working_model);
 
-  // Update the variable statistics.
-  for (int ct_index = old_ct_index;
-       ct_index < context->working_model->constraints_size(); ct_index++) {
-    context->UpdateConstraintVariableUsage(ct_index);
-  }
+  // Update the constraints <-> variables graph.
+  context->UpdateNewConstraintsVariableUsage();
 
   // Add the postsolver clauses to mapping_model.
   ExtractClauses(postsolver, context->mapping_model);
@@ -1918,6 +2050,8 @@ void PresolvePureSatPart(PresolveContext* context) {
 // effect. Like on a triangular matrix where each expansion reduced the size
 // of the objective by one. Investigate and fix?
 void ExpandObjective(PresolveContext* context) {
+  if (context->is_unsat) return;
+
   // This is because we called EncodeObjectiveAsSingleVariable(). Note that
   // it allows us to update the proto objective domain too.
   CHECK_EQ(context->working_model->objective().vars_size(), 1);
@@ -2138,8 +2272,9 @@ void ExpandObjective(PresolveContext* context) {
 }
 
 void MergeNoOverlapConstraints(PresolveContext* context) {
-  const int num_constraints = context->working_model->constraints_size();
+  if (context->is_unsat) return;
 
+  const int num_constraints = context->working_model->constraints_size();
   int old_num_no_overlaps = 0;
   int old_num_intervals = 0;
 
@@ -2197,6 +2332,179 @@ void MergeNoOverlapConstraints(PresolveContext* context) {
   }
 }
 
+bool PresolveOneConstraint(int c, PresolveContext* context) {
+  ConstraintProto* ct = context->working_model->mutable_constraints(c);
+
+  // Generic presolve to exploit variable/literal equivalence.
+  if (ExploitEquivalenceRelations(ct, context)) {
+    context->UpdateConstraintVariableUsage(c);
+  }
+
+  // Generic presolve for reified constraint.
+  if (PresolveEnforcementLiteral(ct, context)) {
+    context->UpdateConstraintVariableUsage(c);
+  }
+
+  // Call the presolve function for this constraint if any.
+  switch (ct->constraint_case()) {
+    case ConstraintProto::ConstraintCase::kBoolOr:
+      return PresolveBoolOr(ct, context);
+    case ConstraintProto::ConstraintCase::kBoolAnd:
+      return PresolveBoolAnd(ct, context);
+    case ConstraintProto::ConstraintCase::kAtMostOne:
+      return PresolveAtMostOne(ct, context);
+    case ConstraintProto::ConstraintCase::kIntMax:
+      return PresolveIntMax(ct, context);
+    case ConstraintProto::ConstraintCase::kIntMin:
+      return PresolveIntMin(ct, context);
+    case ConstraintProto::ConstraintCase::kIntProd:
+      return PresolveIntProd(ct, context);
+    case ConstraintProto::ConstraintCase::kIntDiv:
+      return PresolveIntDiv(ct, context);
+    case ConstraintProto::ConstraintCase::kLinear: {
+      bool changed = PresolveLinear(ct, context);
+      if (changed) context->UpdateConstraintVariableUsage(c);
+      if (ct->constraint_case() == ConstraintProto::ConstraintCase::kLinear) {
+        // Tricky: This is needed in case the variables have been mapped to
+        // their representative by PresolveLinear() above.
+        changed |= PresolveLinearOnBooleans(ct, context);
+      }
+      return changed;
+    }
+    case ConstraintProto::ConstraintCase::kInterval:
+      return PresolveInterval(ct, context);
+    case ConstraintProto::ConstraintCase::kElement:
+      return PresolveElement(ct, context);
+    case ConstraintProto::ConstraintCase::kTable:
+      return PresolveTable(ct, context);
+    case ConstraintProto::ConstraintCase::kAllDiff:
+      return PresolveAllDiff(ct, context);
+    case ConstraintProto::ConstraintCase::kNoOverlap:
+      return PresolveNoOverlap(ct, context);
+    case ConstraintProto::ConstraintCase::kCumulative:
+      return PresolveCumulative(ct, context);
+    case ConstraintProto::ConstraintCase::kCircuit:
+      return PresolveCircuit(ct, context);
+    default:
+      return false;
+  }
+}
+
+void PresolveToFixPoint(PresolveContext* context) {
+  if (context->is_unsat) return;
+
+  // This is used for constraint having unique variables in them (i.e. not
+  // appearing anywhere else) to not call the presolve more than once for this
+  // reason.
+  absl::flat_hash_set<std::pair<int, int>> var_constraint_pair_already_called;
+
+  // The queue of "active" constraints, initialized to all of them.
+  std::vector<bool> in_queue(context->working_model->constraints_size(), true);
+  std::deque<int> queue(context->working_model->constraints_size());
+  std::iota(queue.begin(), queue.end(), 0);
+  while (!queue.empty() && !context->is_unsat) {
+    while (!queue.empty() && !context->is_unsat) {
+      const int c = queue.front();
+      in_queue[c] = false;
+      queue.pop_front();
+
+      const int old_num_constraint = context->working_model->constraints_size();
+      const bool changed = PresolveOneConstraint(c, context);
+
+      // Add to the queue any newly created constraints.
+      const int new_num_constraints =
+          context->working_model->constraints_size();
+      if (new_num_constraints > old_num_constraint) {
+        context->UpdateNewConstraintsVariableUsage();
+        in_queue.resize(new_num_constraints, true);
+        for (int c = old_num_constraint; c < new_num_constraints; ++c) {
+          queue.push_back(c);
+        }
+      }
+
+      // TODO(user): Is seems safer to simply remove the changed Boolean.
+      // We loose a bit of preformance, but the code is simpler.
+      if (changed) {
+        context->UpdateConstraintVariableUsage(c);
+      }
+    }
+
+    // Re-add to the queue constraints that have unique variables. Note that to
+    // not enter an infinite loop, we call each (var, constraint) pair at most
+    // once.
+    for (int v = 0; v < context->var_to_constraints.size(); ++v) {
+      const auto& constraints = context->var_to_constraints[v];
+      if (constraints.size() != 1) continue;
+      const int c = *constraints.begin();
+      if (c < 0) continue;
+      if (gtl::ContainsKey(var_constraint_pair_already_called,
+                           std::pair<int, int>(v, c))) {
+        continue;
+      }
+      var_constraint_pair_already_called.insert({v, c});
+      if (!in_queue[c]) {
+        in_queue[c] = true;
+        queue.push_back(c);
+      }
+    }
+
+    // Re-add to the queue the constraints that touch a variable that changed.
+    //
+    // TODO(user): Avoid reprocessing the constraints that changed the variables
+    // with the use of timestamp.
+    const int old_queue_size = queue.size();
+    for (const int v : context->modified_domains.PositionsSetAtLeastOnce()) {
+      if (context->DomainIsEmpty(v)) {
+        context->is_unsat = true;
+        break;
+      }
+      if (context->IsFixed(v)) context->ExploitFixedDomain(v);
+
+      for (const int c : context->var_to_constraints[v]) {
+        if (c >= 0 && !in_queue[c]) {
+          in_queue[c] = true;
+          queue.push_back(c);
+        }
+      }
+    }
+
+    // Make sure the order is deterministic! because var_to_constraints[]
+    // order changes from one run to the next.
+    std::sort(queue.begin() + old_queue_size, queue.end());
+    context->modified_domains.SparseClearAll();
+  }
+
+  if (context->is_unsat) return;
+
+  // Make sure we filter out absent intervals.
+  //
+  // TODO(user): ideally we should "wake-up" any constraint that contains an
+  // absent interval in the main propagation loop above. But we currently don't
+  // maintain such list.
+  const int num_constraints = context->working_model->constraints_size();
+  for (int c = 0; c < num_constraints; ++c) {
+    ConstraintProto* ct = context->working_model->mutable_constraints(c);
+    switch (ct->constraint_case()) {
+      case ConstraintProto::ConstraintCase::kNoOverlap:
+        if (PresolveNoOverlap(ct, context)) {
+          context->UpdateConstraintVariableUsage(c);
+        }
+        break;
+      case ConstraintProto::ConstraintCase::kNoOverlap2D:
+        // TODO(user): Implement if we ever support optional intervals in
+        // this constraint. Currently we do not.
+        break;
+      case ConstraintProto::ConstraintCase::kCumulative:
+        if (PresolveCumulative(ct, context)) {
+          context->UpdateConstraintVariableUsage(c);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 }  // namespace.
 
 // =============================================================================
@@ -2240,25 +2548,12 @@ void PresolveCpModel(bool log_info, CpModelProto* presolved_model,
   // constraint.
   EncodeObjectiveAsSingleVariable(context.working_model);
 
-  // The queue of "active" constraints, initialized to all of them.
-  std::vector<bool> in_queue(context.working_model->constraints_size(), true);
-  std::deque<int> queue(context.working_model->constraints_size());
-  std::iota(queue.begin(), queue.end(), 0);
-
-  // This is used for constraint having unique variables in them (i.e. not
-  // appearing anywhere else) to not call the presolve more than once for this
-  // reason.
-  absl::flat_hash_set<std::pair<int, int>> var_constraint_pair_already_called;
-
   // Initialize the initial context.working_model domains.
   context.InitializeNewDomains();
 
   // Initialize the constraint <-> variable graph.
-  context.constraint_to_vars.resize(context.working_model->constraints_size());
   context.var_to_constraints.resize(context.working_model->variables_size());
-  for (int c = 0; c < context.working_model->constraints_size(); ++c) {
-    context.UpdateConstraintVariableUsage(c);
-  }
+  context.UpdateNewConstraintsVariableUsage();
 
   // Hack for the objective so that it is never considered to appear in only one
   // constraint.
@@ -2268,157 +2563,31 @@ void PresolveCpModel(bool log_info, CpModelProto* presolved_model,
     }
   }
 
-  while (!queue.empty() && !context.is_unsat) {
-    while (!queue.empty() && !context.is_unsat) {
-      const int c = queue.front();
-      in_queue[c] = false;
-      queue.pop_front();
+  // Main propagation loop.
+  PresolveToFixPoint(&context);
 
-      const int old_num_constraint = context.working_model->constraints_size();
-      ConstraintProto* ct = context.working_model->mutable_constraints(c);
+  // Runs the probing.
+  // TODO(user): do that and the pure-SAT part below more than once.
+  // TODO(user): Expose parameters to control this.
+  Probe(&context);
+  PresolveToFixPoint(&context);
 
-      // Generic presolve to exploit variable/literal equivalence.
-      if (ExploitEquivalenceRelations(ct, &context)) {
-        context.UpdateConstraintVariableUsage(c);
-      }
-
-      // Generic presolve for reified constraint.
-      if (PresolveEnforcementLiteral(ct, &context)) {
-        context.UpdateConstraintVariableUsage(c);
-      }
-
-      // Call the presolve function for this constraint if any.
-      bool changed = false;
-      switch (ct->constraint_case()) {
-        case ConstraintProto::ConstraintCase::kBoolOr:
-          changed |= PresolveBoolOr(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kBoolAnd:
-          changed |= PresolveBoolAnd(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kAtMostOne:
-          changed |= PresolveAtMostOne(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kIntMax:
-          changed |= PresolveIntMax(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kIntMin:
-          changed |= PresolveIntMin(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kIntProd:
-          changed |= PresolveIntProd(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kIntDiv:
-          changed |= PresolveIntDiv(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kLinear:
-          changed |= PresolveLinear(ct, &context);
-          if (ct->constraint_case() ==
-              ConstraintProto::ConstraintCase::kLinear) {
-            // Tricky: This is needed in case the variables have been mapped to
-            // their representative by PresolveLinear() above.
-            if (changed) context.UpdateConstraintVariableUsage(c);
-            changed |= PresolveLinearOnBooleans(ct, &context);
-          }
-          break;
-        case ConstraintProto::ConstraintCase::kInterval:
-          changed |= PresolveInterval(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kElement:
-          changed |= PresolveElement(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kTable:
-          changed |= PresolveTable(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kAllDiff:
-          changed |= PresolveAllDiff(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kNoOverlap:
-          changed |= PresolveNoOverlap(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kCumulative:
-          changed |= PresolveCumulative(ct, &context);
-          break;
-        case ConstraintProto::ConstraintCase::kCircuit:
-          changed |= PresolveCircuit(ct, &context);
-          break;
-        default:
-          break;
-      }
-
-      // Update the variable <-> constraint graph if needed and add any new
-      // constraint to the queue of active constraint.
-      const int new_num_constraints = context.working_model->constraints_size();
-      if (!changed) {
-        CHECK_EQ(new_num_constraints, old_num_constraint);
-        continue;
-      }
-      context.UpdateConstraintVariableUsage(c);
-      if (new_num_constraints > old_num_constraint) {
-        context.constraint_to_vars.resize(new_num_constraints);
-        in_queue.resize(new_num_constraints, true);
-        for (int c = old_num_constraint; c < new_num_constraints; ++c) {
-          queue.push_back(c);
-          context.UpdateConstraintVariableUsage(c);
-        }
-      }
-    }
-
-    // Re-add to the queue constraints that have unique variables. Note that to
-    // not enter an infinite loop, we call each (var, constraint) pair at most
-    // once.
-    for (int v = 0; v < context.var_to_constraints.size(); ++v) {
-      const auto& constraints = context.var_to_constraints[v];
-      if (constraints.size() != 1) continue;
-      const int c = *constraints.begin();
-      if (c < 0) continue;
-      if (gtl::ContainsKey(var_constraint_pair_already_called,
-                           std::pair<int, int>(v, c))) {
-        continue;
-      }
-      var_constraint_pair_already_called.insert({v, c});
-      if (!in_queue[c]) {
-        in_queue[c] = true;
-        queue.push_back(c);
-      }
-    }
-
-    // Re-add to the queue the constraints that touch a variable that changed.
-    //
-    // TODO(user): Avoid reprocessing the constraints that changed the variables
-    // with the use of timestamp.
-    const int old_queue_size = queue.size();
-    for (const int v : context.modified_domains.PositionsSetAtLeastOnce()) {
-      if (context.DomainIsEmpty(v)) {
-        context.is_unsat = true;
-        break;
-      }
-      if (context.IsFixed(v)) context.ExploitFixedDomain(v);
-
-      // We need the intermediate vector to stay deterministic.
-      std::vector<int> to_add;
-      for (const int c : context.var_to_constraints[v]) {
-        if (c >= 0 && !in_queue[c]) {
-          to_add.push_back(c);
-        }
-      }
-      std::sort(to_add.begin(), to_add.end());
-      for (const int c : to_add) {
-        in_queue[c] = true;
-        queue.push_back(c);
-      }
-    }
-
-    // Make sure the order is deterministic! because var_to_constraints[]
-    // order changes from one run to the next.
-    std::sort(queue.begin() + old_queue_size, queue.end());
-    context.modified_domains.SparseClearAll();
-  }
+  // Run SAT specific presolve on the pure-SAT part of the problem.
+  // Note that because this can only remove/fix variable not used in the other
+  // part of the problem, there is no need to redo more presolve afterwards.
+  //
+  // TODO(user): expose the parameters here so we can use
+  // cp_model_use_sat_presolve().
+  PresolvePureSatPart(&context);
 
   // Extract redundant at most one constraint form the linear ones.
   //
   // TODO(user): more generally if we do some probing, the same relation will
   // be detected (and more). Also add an option to turn this off?
+  //
+  // TODO(user): instead of extracting at most one, extra pairwise conflicts
+  // and add them to bool_and clauses? this is some sort of small scale probing,
+  // but good for sat presolve and clique later?
   if (!context.is_unsat) {
     const int old_size = context.working_model->constraints_size();
     for (int c = 0; c < old_size; ++c) {
@@ -2431,19 +2600,7 @@ void PresolveCpModel(bool log_info, CpModelProto* presolved_model,
       }
       ExtractAtMostOneFromLinear(ct, &context);
     }
-    for (int c = old_size; c < context.working_model->constraints_size(); ++c) {
-      context.UpdateConstraintVariableUsage(c);
-    }
-  }
-
-  // Run SAT specific presolve on the pure-SAT part of the problem.
-  // Note that because this can only remove/fix variable not used in the other
-  // part of the problem, there is no need to redo more presolve afterwards.
-  //
-  // TODO(user): expose the parameters here so we can use
-  // cp_model_use_sat_presolve().
-  if (!context.is_unsat) {
-    PresolvePureSatPart(&context);
+    context.UpdateNewConstraintsVariableUsage();
   }
 
   if (context.is_unsat) {
@@ -2453,6 +2610,7 @@ void PresolveCpModel(bool log_info, CpModelProto* presolved_model,
     return;
   }
 
+  // Regroup no-overlaps into max-cliques.
   MergeNoOverlapConstraints(&context);
 
   // Remove all affine constraints (they will be re-added later if
@@ -2464,35 +2622,16 @@ void PresolveCpModel(bool log_info, CpModelProto* presolved_model,
       context.UpdateConstraintVariableUsage(c);
       continue;
     }
-
-    // Make sure we filter out absent intervals.
-    //
-    // TODO(user): ideally we should "wake-up" any constraint that contains an
-    // absent interval in the main propagation loop above. But we currently
-    // don't maintain such list.
-    switch (ct->constraint_case()) {
-      case ConstraintProto::ConstraintCase::kNoOverlap:
-        if (PresolveNoOverlap(ct, &context)) {
-          context.UpdateConstraintVariableUsage(c);
-        }
-        break;
-      case ConstraintProto::ConstraintCase::kNoOverlap2D:
-        // TODO(user): Implement if we ever support optional intervals in
-        // this constraint. Currently we do not.
-        break;
-      case ConstraintProto::ConstraintCase::kCumulative:
-        if (PresolveCumulative(ct, &context)) {
-          context.UpdateConstraintVariableUsage(c);
-        }
-        break;
-      default:
-        break;
-    }
   }
 
   if (context.working_model->has_objective()) {
     ExpandObjective(&context);
   }
+
+  // TODO(user): Past this point the context.constraint_to_vars[] graph is not
+  // consistent and shouldn't be used. We do use var_to_constraints.size()
+  // though.
+  DCHECK(context.ConstraintVariableUsageIsConsistent());
 
   // Add back the affine relations to the presolved model or to the mapping
   // model, depending where they are needed.
@@ -2549,14 +2688,14 @@ void PresolveCpModel(bool log_info, CpModelProto* presolved_model,
   std::vector<int> interval_mapping(presolved_model->constraints_size(), -1);
   int new_num_constraints = 0;
   const int old_num_constraints = presolved_model->constraints_size();
-  for (int i = 0; i < old_num_constraints; ++i) {
-    const auto type = presolved_model->constraints(i).constraint_case();
+  for (int c = 0; c < old_num_constraints; ++c) {
+    const auto type = presolved_model->constraints(c).constraint_case();
     if (type == ConstraintProto::ConstraintCase::CONSTRAINT_NOT_SET) continue;
     if (type == ConstraintProto::ConstraintCase::kInterval) {
-      interval_mapping[i] = new_num_constraints;
+      interval_mapping[c] = new_num_constraints;
     }
     presolved_model->mutable_constraints(new_num_constraints++)
-        ->Swap(presolved_model->mutable_constraints(i));
+        ->Swap(presolved_model->mutable_constraints(c));
   }
   presolved_model->mutable_constraints()->DeleteSubrange(
       new_num_constraints, old_num_constraints - new_num_constraints);

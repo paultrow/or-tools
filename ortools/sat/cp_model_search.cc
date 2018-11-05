@@ -277,15 +277,20 @@ SatParameters DiversifySearchParameters(const SatParameters& params,
   new_params.set_random_seed(params.random_seed() + worker_id);
   if (cp_model.has_objective()) {
     switch (worker_id) {
-      case 0: {  // Use default parameters and fixed search.
-        new_params.set_search_branching(SatParameters::FIXED_SEARCH);
-        *name = "fixed";
-        break;
-      }
-      case 1: {  // Use default parameters and automatic search.
+      case 0: {  // Use default parameters and automatic search.
         new_params.set_search_branching(SatParameters::AUTOMATIC_SEARCH);
         new_params.set_linearization_level(1);
         *name = "auto";
+        break;
+      }
+      case 1: {  // Use default parameters and fixed search if there is one.
+        if (cp_model.search_strategy_size() > 0) {
+          new_params.set_search_branching(SatParameters::FIXED_SEARCH);
+          *name = "fixed";
+        } else {  // Use LP_SEARCH if not.
+          new_params.set_search_branching(SatParameters::LP_SEARCH);
+          *name = "lp_br";
+        }
         break;
       }
       case 2: {  // Remove LP relaxation.

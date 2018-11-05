@@ -259,7 +259,7 @@ bool LoadAndConsumeBooleanProblem(LinearBooleanProblem* problem,
                                   SatSolver* solver) {
   const util::Status status = ValidateBooleanProblem(*problem);
   if (!status.ok()) {
-    LOG(WARNING) << "The given problem is invalid! " << status.error_message();
+    LOG(WARNING) << "The given problem is invalid! " << status.message();
   }
   if (solver->parameters().log_search_progress()) {
 #if !defined(__PORTABLE_PLATFORM__)

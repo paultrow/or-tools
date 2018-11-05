@@ -704,8 +704,14 @@ bool BinaryImplicationGraph::DetectEquivalences() {
   reverse_topological_order_.clear();
   representative_of_.assign(size, kNoLiteralIndex);
   for (std::vector<int32>& component : scc) {
+    // We always take the smallest literal index (which also corresponds to the
+    // smallest BooleanVariable index) as a representative. This make sure that
+    // the representative of a literal l and the one of not(l) will be the
+    // negation of each other. There is also reason to think that it is
+    // heuristically better to use a BooleanVariable that was created first.
     std::sort(component.begin(), component.end());
     const LiteralIndex representative(component[0]);
+
     reverse_topological_order_.push_back(representative);
     if (component.size() == 1) {
       continue;
@@ -849,7 +855,8 @@ struct VectorHash {
 
 void BinaryImplicationGraph::TransformIntoMaxCliques(
     std::vector<std::vector<Literal>>* at_most_ones) {
-  CHECK(is_dag_);
+  // The code below assumes a DAG.
+  if (!is_dag_) DetectEquivalences();
   work_done_in_mark_descendants_ = 0;
 
   int num_extended = 0;
@@ -870,9 +877,10 @@ void BinaryImplicationGraph::TransformIntoMaxCliques(
 
     // Remap the clique to only use representative.
     //
-    // TODO(user): that might cause problem if the representative was not
-    // in the initial cp_model... We should really remove all these equivalence
-    // beforehand.
+    // Note(user): Because we always use literal with the smallest variable
+    // indices as representative, this make sure that if possible, we express
+    // the clique in term of user provided variable (that are always created
+    // first).
     for (Literal& ref : clique) {
       const LiteralIndex rep = representative_of_[ref.Index()];
       if (rep == kNoLiteralIndex) continue;

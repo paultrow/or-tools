@@ -128,6 +128,8 @@ class SatSolver {
   // Thanks to this function, a client can safely ignore the return value of any
   // Add*() functions. If one of them return false, then IsModelUnsat() will
   // return true.
+  //
+  // TODO(user): Rename to ModelIsUnsat().
   bool IsModelUnsat() const { return is_model_unsat_; }
 
   // Adds and registers the given propagator with the sat solver. Note that

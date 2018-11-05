@@ -442,8 +442,19 @@ class BinaryImplicationGraph : public SatPropagator {
   // (with respect to the implications only) and reorganize the propagation
   // lists accordingly.
   //
-  // TODO(user): Completely get rid of such literal instead.
+  // TODO(user): Completely get rid of such literal instead? it might not be
+  // reasonable code-wise to remap our literals in all of our constraints
+  // though.
   bool DetectEquivalences();
+
+  // Returns the representative of the equivalence class of l (or l itself if it
+  // is on its own). Note that DetectEquivalences() should have been called to
+  // get any non-trival results.
+  Literal RepresentativeOf(Literal l) {
+    if (l.Index() >= representative_of_.size()) return l;
+    if (representative_of_[l.Index()] == kNoLiteralIndex) return l;
+    return Literal(representative_of_[l.Index()]);
+  }
 
   // Prunes the implication graph by calling first DetectEquivalences() to
   // remove cycle and then by computing the transitive reduction of the
@@ -460,8 +471,6 @@ class BinaryImplicationGraph : public SatPropagator {
   // This function will transform each of the given constraint into a maximal
   // one in the underlying implication graph. Constraints that are redundant
   // after other have been expanded (i.e. included into) will be cleared.
-  //
-  // Preconditions: DetectEquivalences() must have been called just before.
   void TransformIntoMaxCliques(std::vector<std::vector<Literal>>* at_most_ones);
 
   // Number of literal propagated by this class (including conflicts).

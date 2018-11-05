@@ -81,6 +81,10 @@ inline bool VariableIsPositive(IntegerVariable i) {
   return (i.value() & 1) == 0;
 }
 
+inline IntegerVariable PositiveVariable(IntegerVariable i) {
+  return IntegerVariable(i.value() & (~1));
+}
+
 // Returns the vector of the negated variables.
 std::vector<IntegerVariable> NegationOf(
     const std::vector<IntegerVariable>& vars);
@@ -501,6 +505,10 @@ class IntegerTrail : public SatPropagator {
   IntegerLiteral LowerBoundAsLiteral(IntegerVariable i) const;
   IntegerLiteral UpperBoundAsLiteral(IntegerVariable i) const;
 
+  // Returns the current value (if known) of an IntegerLiteral.
+  bool IntegerLiteralIsTrue(IntegerLiteral l) const;
+  bool IntegerLiteralIsFalse(IntegerLiteral l) const;
+
   // Advanced usage. Given the reason for
   // (Sum_i coeffs[i] * reason[i].var >= current_lb) initially in reason,
   // this function relaxes the reason given that we only need the explanation of
@@ -630,6 +638,11 @@ class IntegerTrail : public SatPropagator {
 
   int Index() const { return integer_trail_.size(); }
 
+  // Inspects the trail and output all the non-level zero bounds (one per
+  // variables) to the output. The algo is sparse if there is only a few
+  // propagations on the trail.
+  void AppendNewBounds(std::vector<IntegerLiteral>* output) const;
+
  private:
   // Used for DHECKs to validate the reason given to the public functions above.
   // Tests that all Literal are false. Tests that all IntegerLiteral are true.
@@ -732,6 +745,9 @@ class IntegerTrail : public SatPropagator {
   mutable std::vector<IntegerVariable> tmp_to_clear_;
   mutable gtl::ITIVector<IntegerVariable, int> tmp_var_to_trail_index_in_queue_;
   mutable SparseBitset<BooleanVariable> added_variables_;
+
+  // Temporary data used by AppendNewBounds().
+  mutable SparseBitset<IntegerVariable> tmp_marked_;
 
   // For EnqueueLiteral(), we store a special TrailEntry to recover the reason
   // lazily. This vector indicates the correspondence between a literal that
@@ -952,6 +968,14 @@ inline IntegerLiteral IntegerTrail::LowerBoundAsLiteral(
 inline IntegerLiteral IntegerTrail::UpperBoundAsLiteral(
     IntegerVariable i) const {
   return IntegerLiteral::LowerOrEqual(i, UpperBound(i));
+}
+
+inline bool IntegerTrail::IntegerLiteralIsTrue(IntegerLiteral l) const {
+  return l.bound <= LowerBound(l.var);
+}
+
+inline bool IntegerTrail::IntegerLiteralIsFalse(IntegerLiteral l) const {
+  return l.bound > UpperBound(l.var);
 }
 
 inline void GenericLiteralWatcher::WatchLiteral(Literal l, int id,

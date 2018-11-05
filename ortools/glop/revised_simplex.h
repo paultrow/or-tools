@@ -367,8 +367,8 @@ class RevisedSimplex {
 
   // Sets the initial basis to the given columns, try to factorize it and
   // recompute the basic variable values.
-  ABSL_MUST_USE_RESULT Status InitializeFirstBasis(
-      const RowToColMapping& initial_basis);
+  ABSL_MUST_USE_RESULT Status
+  InitializeFirstBasis(const RowToColMapping& initial_basis);
 
   // Entry point for the solver initialization.
   ABSL_MUST_USE_RESULT Status Initialize(const LinearProgram& lp);

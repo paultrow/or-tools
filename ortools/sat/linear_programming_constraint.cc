@@ -773,7 +773,7 @@ IntegerValue LinearProgrammingConstraint::ExactLpReasonning() {
     // Remark: This is nothing else than basic bound propagation of the
     // new_constraint with the given feasibility_slack between its implied lower
     // bound and its upper bound.
-    IntegerValue used_slack(0);
+    IntegerValue explanation_slack = kMaxIntegerValue;
     const IntegerValue feasibility_slack = IntegerValue(
         CapSub(scaled_objective_ub.value(), scaled_objective_lb.value()));
     CHECK_GE(feasibility_slack, 0);
@@ -792,14 +792,18 @@ IntegerValue LinearProgrammingConstraint::ExactLpReasonning() {
           const IntegerValue new_ub =
               integer_trail_->LowerBound(var) + allowed_change;
           if (new_ub < integer_trail_->UpperBound(var)) {
-            used_slack = std::max(used_slack, allowed_change * coeff);
+            explanation_slack =
+                std::min(explanation_slack,
+                         (allowed_change + 1) * coeff - feasibility_slack - 1);
             deductions_.push_back(IntegerLiteral::LowerOrEqual(var, new_ub));
           }
         } else {  // coeff < 0
           const IntegerValue new_lb =
               integer_trail_->UpperBound(var) - allowed_change;
           if (new_lb > integer_trail_->LowerBound(var)) {
-            used_slack = std::max(used_slack, allowed_change * -coeff);
+            explanation_slack =
+                std::min(explanation_slack,
+                         (allowed_change + 1) * -coeff - feasibility_slack - 1);
             deductions_.push_back(IntegerLiteral::GreaterOrEqual(var, new_lb));
           }
         }
@@ -807,15 +811,20 @@ IntegerValue LinearProgrammingConstraint::ExactLpReasonning() {
     }
 
     if (!deductions_.empty()) {
-      // TODO(user): Instead of taking used_slack as the max of the slack of all
-      // deductions, we could use different reason for each push instead.
+      // TODO(user): Instead of taking explanation_slack as the min of the slack
+      // of all deductions, we could use different reason for each push instead.
       // Experiment! Maybe there is some tradeoff depending on the number of
       // push.
       //
       // TODO(user): The individual reason are even smaller because we can
       // ignore the term corresponding to the variable we push.
-      const IntegerValue slack_left = feasibility_slack - used_slack;
-      SetImpliedLowerBoundReason(new_constraint, slack_left);
+      //
+      // TODO(user): The proper fix might be to add a lazy reason code
+      // that can reconstruct the relaxed reason on demand from a base one.
+      // So we have better reason, and not more work at propagation time.
+      // Also, this code should be shared with the one in IntegerSumLE since
+      // they are the same, and it will facilitate unit-testing.
+      SetImpliedLowerBoundReason(new_constraint, explanation_slack);
       deductions_reason_ = integer_reason_;
       deductions_reason_.push_back(
           integer_trail_->UpperBoundAsLiteral(objective_cp_));
