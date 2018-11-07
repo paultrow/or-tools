@@ -282,8 +282,9 @@ void CpModelProtoWithMapping::FillConstraint(const fz::Constraint& fz_ct,
                             fz_ct.arguments[1].values.end()}),
                         arg);
     } else if (fz_ct.arguments[1].type == fz::Argument::INT_INTERVAL) {
-      FillDomain({{fz_ct.arguments[1].values[0], fz_ct.arguments[1].values[1]}},
-                 arg);
+      FillDomainInProto(
+          Domain(fz_ct.arguments[1].values[0], fz_ct.arguments[1].values[1]),
+          arg);
     } else {
       LOG(FATAL) << "Wrong format";
     }
@@ -336,7 +337,7 @@ void CpModelProtoWithMapping::FillConstraint(const fz::Constraint& fz_ct,
     arg->add_vars(-LookupVar(fz_ct.arguments[0]) - 1);
   } else if (fz_ct.type == "int_plus") {
     auto* arg = ct->mutable_linear();
-    FillDomain({{0, 0}}, arg);
+    FillDomainInProto(Domain(0, 0), arg);
     arg->add_vars(LookupVar(fz_ct.arguments[0]));
     arg->add_coeffs(1);
     arg->add_vars(LookupVar(fz_ct.arguments[1]));

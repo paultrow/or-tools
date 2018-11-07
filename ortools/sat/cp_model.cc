@@ -338,7 +338,7 @@ int CpModelBuilder::GetOrCreateIntegerIndex(int index) {
 IntVar CpModelBuilder::NewIntVar(const Domain& domain) {
   const int index = cp_model_.variables_size();
   IntegerVariableProto* const var_proto = cp_model_.add_variables();
-  for (const auto& interval : domain.intervals()) {
+  for (const auto& interval : domain) {
     var_proto->add_domain(interval.start);
     var_proto->add_domain(interval.end);
   }
@@ -484,7 +484,7 @@ Constraint CpModelBuilder::AddLinearConstraint(const LinearExpr& expr,
     proto->mutable_linear()->add_coeffs(coeff);
   }
   const int64 cst = expr.constant();
-  for (const auto& i : domain.intervals()) {
+  for (const auto& i : domain) {
     proto->mutable_linear()->add_domain(i.start - cst);
     proto->mutable_linear()->add_domain(i.end - cst);
   }
@@ -685,6 +685,16 @@ void CpModelBuilder::Maximize(const LinearExpr& expr) {
   cp_model_.mutable_objective()->set_scaling_factor(-1.0);
 }
 
+void CpModelBuilder::SetObjectiveScaling(double scaling) {
+  CHECK(cp_model_.has_objective());
+  const double current_scaling = cp_model_.objective().scaling_factor();
+  if (current_scaling >= 0.0) {
+    cp_model_.mutable_objective()->set_scaling_factor(scaling);
+  } else {
+    cp_model_.mutable_objective()->set_scaling_factor(-scaling);
+  }
+}
+
 void CpModelBuilder::AddDecisionStrategy(
     absl::Span<const IntVar> variables,
     DecisionStrategyProto::VariableSelectionStrategy var_strategy,
@@ -724,6 +734,22 @@ int64 SolutionIntegerValue(const CpSolverResponse& r, const LinearExpr& expr) {
     result += r.solution(expr.variables()[i].index_) * expr.coefficients()[i];
   }
   return result;
+}
+
+int64 SolutionIntegerMin(const CpSolverResponse& r, IntVar x) {
+  if (r.solution_size() > 0) {
+    return r.solution(x.index_);
+  } else {
+    return r.solution_lower_bounds(x.index_);
+  }
+}
+
+int64 SolutionIntegerMax(const CpSolverResponse& r, IntVar x) {
+  if (r.solution_size() > 0) {
+    return r.solution(x.index_);
+  } else {
+    return r.solution_upper_bounds(x.index_);
+  }
 }
 
 bool SolutionBooleanValue(const CpSolverResponse& r, BoolVar x) {

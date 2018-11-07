@@ -36,7 +36,7 @@ std::vector<IntegerVariable> NegationOf(
 void IntegerEncoder::FullyEncodeVariable(IntegerVariable var) {
   CHECK(!VariableIsFullyEncoded(var));
   CHECK_EQ(0, sat_solver_->CurrentDecisionLevel());
-  CHECK(!(*domains_)[var].empty());  // UNSAT. We don't deal with that here.
+  CHECK(!(*domains_)[var].IsEmpty());  // UNSAT. We don't deal with that here.
 
   std::vector<IntegerValue> values;
   for (const ClosedInterval interval : (*domains_)[var]) {
@@ -137,8 +137,8 @@ IntegerEncoder::PartialDomainEncoding(IntegerVariable var) const {
   if (var >= encoding_by_var_.size()) return encoding;
 
   std::set<IntegerValue> possible_values;
-  possible_values.insert(IntegerValue((*domains_)[var].front().start));
-  possible_values.insert(IntegerValue((*domains_)[var].back().end));
+  possible_values.insert(IntegerValue((*domains_)[var].Min()));
+  possible_values.insert(IntegerValue((*domains_)[var].Max()));
   for (const auto entry : encoding_by_var_[var]) {
     possible_values.insert(entry.first);
   }
@@ -218,8 +218,8 @@ std::pair<IntegerLiteral, IntegerLiteral> IntegerEncoder::Canonicalize(
   const IntegerVariable var(i_lit.var);
   IntegerValue after(i_lit.bound);
   IntegerValue before(i_lit.bound - 1);
-  CHECK_GE(before, (*domains_)[var].front().start);
-  CHECK_LE(after, (*domains_)[var].back().end);
+  CHECK_GE(before, (*domains_)[var].Min());
+  CHECK_LE(after, (*domains_)[var].Max());
   int64 previous = kint64min;
   for (const ClosedInterval& interval : (*domains_)[var]) {
     if (before > previous && before < interval.start) before = previous;
@@ -232,10 +232,10 @@ std::pair<IntegerLiteral, IntegerLiteral> IntegerEncoder::Canonicalize(
 }
 
 Literal IntegerEncoder::GetOrCreateAssociatedLiteral(IntegerLiteral i_lit) {
-  if (i_lit.bound <= (*domains_)[i_lit.var].front().start) {
+  if (i_lit.bound <= (*domains_)[i_lit.var].Min()) {
     return GetTrueLiteral();
   }
-  if (i_lit.bound > (*domains_)[i_lit.var].back().end) {
+  if (i_lit.bound > (*domains_)[i_lit.var].Max()) {
     return GetFalseLiteral();
   }
 
@@ -273,8 +273,8 @@ Literal IntegerEncoder::GetOrCreateLiteralAssociatedToEquality(
 void IntegerEncoder::AssociateToIntegerLiteral(Literal literal,
                                                IntegerLiteral i_lit) {
   const auto& domain = (*domains_)[i_lit.var];
-  const IntegerValue min(domain.front().start);
-  const IntegerValue max(domain.back().end);
+  const IntegerValue min(domain.Min());
+  const IntegerValue max(domain.Max());
   if (i_lit.bound <= min) {
     sat_solver_->AddUnitClause(literal);
   } else if (i_lit.bound > max) {
@@ -302,7 +302,7 @@ void IntegerEncoder::AssociateToIntegerEqualValue(Literal literal,
   // Detect literal view. Note that the same literal can be associated to more
   // than one variable, and thus already have a view. We don't change it in
   // this case.
-  const Domain domain = Domain::FromIntervals((*domains_)[var]);
+  const Domain& domain = (*domains_)[var];
   if (value == 1 && domain.Min() >= 0 && domain.Max() <= 1) {
     if (literal.Index() >= literal_view_.size()) {
       literal_view_.resize(literal.Index().value() + 1, kNoIntegerVariable);
@@ -522,7 +522,7 @@ IntegerVariable IntegerTrail::AddIntegerVariable(IntegerValue lower_bound,
   vars_.push_back({lower_bound, static_cast<int>(integer_trail_.size())});
   var_trail_index_cache_.push_back(integer_trail_.size());
   integer_trail_.push_back({lower_bound, i});
-  domains_->push_back({{lower_bound.value(), upper_bound.value()}});
+  domains_->push_back(Domain(lower_bound.value(), upper_bound.value()));
 
   // TODO(user): the is_ignored_literals_ Booleans are currently always the same
   // for a variable and its negation. So it may be better not to store it twice
@@ -532,7 +532,7 @@ IntegerVariable IntegerTrail::AddIntegerVariable(IntegerValue lower_bound,
   vars_.push_back({-upper_bound, static_cast<int>(integer_trail_.size())});
   var_trail_index_cache_.push_back(integer_trail_.size());
   integer_trail_.push_back({-upper_bound, NegationOf(i)});
-  domains_->push_back({{-upper_bound.value(), -lower_bound.value()}});
+  domains_->push_back(Domain(-upper_bound.value(), -lower_bound.value()));
 
   for (SparseBitset<IntegerVariable>* w : watchers_) {
     w->Resize(NumIntegerVariables());
@@ -548,12 +548,8 @@ IntegerVariable IntegerTrail::AddIntegerVariable(const Domain& domain) {
   return var;
 }
 
-// Because we use InlinedVectors internally, we need the conversion.
-//
-// TODO(user): we could return a reference, but this is likely not in any
-// critical code path.
-Domain IntegerTrail::InitialVariableDomain(IntegerVariable var) const {
-  return Domain::FromIntervals((*domains_)[var]);
+const Domain& IntegerTrail::InitialVariableDomain(IntegerVariable var) const {
+  return (*domains_)[var];
 }
 
 bool IntegerTrail::UpdateInitialDomain(IntegerVariable var, Domain domain) {
@@ -561,21 +557,15 @@ bool IntegerTrail::UpdateInitialDomain(IntegerVariable var, Domain domain) {
 
   // TODO(user): A bit inefficient as this recreate a vector for no reason.
   // The IntersectionOfSortedDisjointIntervals() should take a Span<> instead.
-  const Domain old_domain = InitialVariableDomain(var);
+  const Domain& old_domain = InitialVariableDomain(var);
   domain = domain.IntersectionWith(old_domain);
   if (old_domain == domain) return true;
   if (domain.IsEmpty()) return false;
 
-  {
-    const std::vector<ClosedInterval> temp = domain.intervals();
-    (*domains_)[var].assign(temp.begin(), temp.end());
-  }
-  {
-    const std::vector<ClosedInterval> temp = domain.Negation().intervals();
-    (*domains_)[NegationOf(var)].assign(temp.begin(), temp.end());
-  }
+  (*domains_)[var] = domain;
+  (*domains_)[NegationOf(var)] = domain.Negation();
 
-  if (domain.intervals().size() > 1) {
+  if (domain.NumIntervals() > 1) {
     var_to_current_lb_interval_index_.Set(var, 0);
     var_to_current_lb_interval_index_.Set(NegationOf(var), 0);
   }
@@ -593,10 +583,9 @@ bool IntegerTrail::UpdateInitialDomain(IntegerVariable var, Domain domain) {
   int i = 0;
   int num_fixed = 0;
   const auto encoding = encoder_->PartialDomainEncoding(var);
-  const auto intervals = domain.intervals();
   for (const auto pair : encoding) {
-    while (i < intervals.size() && pair.value > intervals[i].end) ++i;
-    if (i == intervals.size() || pair.value < intervals[i].start) {
+    while (i < domain.NumIntervals() && pair.value > domain[i].end) ++i;
+    if (i == domain.NumIntervals() || pair.value < domain[i].start) {
       // Set the literal to false;
       ++num_fixed;
       if (trail_->Assignment().LiteralIsTrue(pair.literal)) return false;
@@ -881,10 +870,10 @@ bool IntegerTrail::Enqueue(IntegerLiteral i_lit,
   //
   // Note: The literals in the reason are not necessarily canonical, but then
   // we always map these to enqueued literals during conflict resolution.
-  if ((*domains_)[var].size() > 1) {
+  if ((*domains_)[var].NumIntervals() > 1) {
     const auto& domain = (*domains_)[var];
     int index = var_to_current_lb_interval_index_.FindOrDie(var);
-    const int size = domain.size();
+    const int size = domain.NumIntervals();
     while (index < size && i_lit.bound > domain[index].end) {
       ++index;
     }

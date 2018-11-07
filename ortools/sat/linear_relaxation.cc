@@ -78,7 +78,9 @@ std::pair<IntegerValue, IntegerValue> GetMinAndMaxNotEncoded(
   }
 
   IntegerValue max = kMinIntegerValue;
-  for (const ClosedInterval interval : gtl::reversed_view((*domains)[var])) {
+  const auto& domain = (*domains)[var];
+  for (int i = domain.NumIntervals() - 1; i >= 0; --i) {
+    const ClosedInterval interval = domain[i];
     for (IntegerValue v(interval.end); v >= interval.start; --v) {
       if (!gtl::ContainsKey(encoded_values, v)) {
         max = v;

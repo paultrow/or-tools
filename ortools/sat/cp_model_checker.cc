@@ -49,7 +49,7 @@ bool DomainInProtoIsValid(const ProtoWithDomain& proto) {
   for (int i = 0; i < proto.domain_size(); i += 2) {
     domain.push_back({proto.domain(i), proto.domain(i + 1)});
   }
-  return IntervalsAreSortedAndDisjoint(domain);
+  return IntervalsAreSortedAndNonAdjacent(domain);
 }
 
 bool VariableReferenceIsValid(const CpModelProto& model, int reference) {

@@ -415,8 +415,8 @@ std::string CpModelStats(const CpModelProto& model_proto) {
     for (const auto& entry : num_vars_per_domains) {
       min = std::min(min, entry.first.Min());
       max = std::max(max, entry.first.Max());
-      max_complexity = std::max(
-          max_complexity, static_cast<int64>(entry.first.intervals().size()));
+      max_complexity = std::max(max_complexity,
+                                static_cast<int64>(entry.first.NumIntervals()));
     }
     absl::StrAppend(&result, " - ", num_vars_per_domains.size(),
                     " different domains in [", min, ",", max,
@@ -1683,11 +1683,10 @@ CpSolverResponse SolvePureSatModel(const CpModelProto& model_proto,
 
   // Deal with fixed variables.
   for (int ref = 0; ref < num_variables; ++ref) {
-    const auto domain = ReadDomain(model_proto.variables(ref));
-    CHECK_EQ(domain.size(), 1);
-    if (domain[0].start == domain[0].end) {
+    const Domain domain = ReadDomainFromProto(model_proto.variables(ref));
+    if (domain.Min() == domain.Max()) {
       const Literal ref_literal =
-          domain[0].start == 0 ? get_literal(ref).Negated() : get_literal(ref);
+          domain.Min() == 0 ? get_literal(ref).Negated() : get_literal(ref);
       solver->AddUnitClause(ref_literal);
       if (drat_proof_handler != nullptr) {
         drat_proof_handler->AddProblemClause({ref_literal});
@@ -1863,18 +1862,19 @@ CpSolverResponse SolveCpModelWithLNS(
           local_parameters.set_stop_after_first_solution(false);
           local_model.Add(NewSatParameters(local_parameters));
         }
-        if (limit->ExternalBooleanAsLimit() != nullptr) {
-          TimeLimit* local_limit = local_model.GetOrCreate<TimeLimit>();
-          local_limit->RegisterExternalBooleanAsLimit(
-              limit->ExternalBooleanAsLimit());
-        }
+        local_model.GetOrCreate<TimeLimit>()->MergeWithGlobalTimeLimit(limit);
 
         // Presolve and solve the LNS fragment.
         CpSolverResponse local_response;
         {
           CpModelProto mapping_proto;
           std::vector<int> postsolve_mapping;
-          PresolveCpModel(&local_problem, &mapping_proto, &postsolve_mapping);
+          PresolveOptions options;
+          options.log_info = VLOG_IS_ON(2);
+          options.parameters = local_model.GetOrCreate<SatParameters>();
+          options.time_limit = local_model.GetOrCreate<TimeLimit>();
+          PresolveCpModel(options, &local_problem, &mapping_proto,
+                          &postsolve_mapping);
           local_response = SolveCpModelInternal(
               local_problem, true, [](const CpSolverResponse& response) {},
               &local_model);
@@ -2185,8 +2185,11 @@ CpSolverResponse SolveCpModel(const CpModelProto& model_proto, Model* model) {
     // Do the actual presolve.
     CpModelProto mapping_proto;
     std::vector<int> postsolve_mapping;
-    PresolveCpModel(VLOG_IS_ON(1), &new_model, &mapping_proto,
-                    &postsolve_mapping);
+    PresolveOptions options;
+    options.log_info = VLOG_IS_ON(1);
+    options.parameters = model->GetOrCreate<SatParameters>();
+    options.time_limit = model->GetOrCreate<TimeLimit>();
+    PresolveCpModel(options, &new_model, &mapping_proto, &postsolve_mapping);
     VLOG(1) << CpModelStats(new_model);
     postprocess_solution = [&model_proto, mapping_proto,
                             postsolve_mapping](CpSolverResponse* response) {

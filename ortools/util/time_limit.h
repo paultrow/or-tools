@@ -254,6 +254,7 @@ class TimeLimit {
   // any registered external boolean or calls to RegisterSigintHandler().
   template <typename Parameters>
   void ResetLimitFromParameters(const Parameters& parameters);
+  void MergeWithGlobalTimeLimit(TimeLimit* other);
 
   // Returns information about the time limit object in a human-readable form.
   std::string DebugString() const;
@@ -402,6 +403,17 @@ inline void TimeLimit::ResetLimitFromParameters(const Parameters& parameters) {
   ResetTimers(parameters.max_time_in_seconds(),
               parameters.max_deterministic_time(),
               std::numeric_limits<double>::infinity());
+}
+
+inline void TimeLimit::MergeWithGlobalTimeLimit(TimeLimit* other) {
+  if (other == nullptr) return;
+  ResetTimers(
+      std::min(GetTimeLeft(), other->GetTimeLeft()),
+      std::min(GetDeterministicTimeLeft(), other->GetDeterministicTimeLeft()),
+      std::numeric_limits<double>::infinity());
+  if (other->ExternalBooleanAsLimit() != nullptr) {
+    RegisterExternalBooleanAsLimit(other->ExternalBooleanAsLimit());
+  }
 }
 
 inline double TimeLimit::ReadInstructionCounter() {

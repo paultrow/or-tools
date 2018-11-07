@@ -58,7 +58,7 @@ std::vector<int64> ValuesFromProto(const Values& values) {
 // Returns the size of the given domain capped to int64max.
 int64 DomainSize(const Domain& domain) {
   int64 size = 0;
-  for (const ClosedInterval interval : domain.intervals()) {
+  for (const ClosedInterval interval : domain) {
     size += operations_research::CapAdd(
         1, operations_research::CapSub(interval.end, interval.start));
   }
@@ -82,19 +82,18 @@ ModelWithMapping::ModelWithMapping(const CpModelProto& model_proto,
   // fixed to 0 (domain == [0,0]) or fixed to 1 (domain == [1,1]).
   booleans_.resize(num_proto_variables, kNoBooleanVariable);
   for (int i = 0; i < num_proto_variables; ++i) {
-    const auto domain = ReadDomain(model_proto.variables(i));
-    if (domain.size() != 1) continue;
-    if (domain[0].start >= 0 && domain[0].end <= 1) {
+    const auto domain = ReadDomainFromProto(model_proto.variables(i));
+    if (domain.Min() >= 0 && domain.Max() <= 1) {
       booleans_[i] = Add(NewBooleanVariable());
       if (booleans_[i] >= reverse_boolean_map_.size()) {
         reverse_boolean_map_.resize(booleans_[i].value() + 1, -1);
       }
       reverse_boolean_map_[booleans_[i]] = i;
 
-      if (domain[0].start == 0 && domain[0].end == 0) {
+      if (domain.Max() == 0) {
         // Fix to false.
         Add(ClauseConstraint({sat::Literal(booleans_[i], false)}));
-      } else if (domain[0].start == 1 && domain[0].end == 1) {
+      } else if (domain.Min() == 1) {
         // Fix to true.
         Add(ClauseConstraint({sat::Literal(booleans_[i], true)}));
       }
@@ -266,7 +265,7 @@ void ModelWithMapping::ExtractEncoding(const CpModelProto& model_proto) {
                                      (RefIsPositive(ref) ? 1 : -1));
 
     // Detect enforcement_literal => (var >= value or var <= value).
-    if (domain_if_enforced.intervals().size() == 1) {
+    if (domain_if_enforced.NumIntervals() == 1) {
       if (domain_if_enforced.Max() >= domain.Max() &&
           domain_if_enforced.Min() > domain.Min()) {
         inequalities.push_back(
@@ -704,7 +703,7 @@ void LoadCumulativeConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
 // If a variable is constant and its value appear in no other variable domains,
 // then the literal encoding the index and the one encoding the target at this
 // value are equivalent.
-void DetectEquivalencesInElementConstraint(const ConstraintProto& ct,
+bool DetectEquivalencesInElementConstraint(const ConstraintProto& ct,
                                            ModelWithMapping* m) {
   IntegerEncoder* encoder = m->GetOrCreate<IntegerEncoder>();
   IntegerTrail* integer_trail = m->GetOrCreate<IntegerTrail>();
@@ -712,8 +711,8 @@ void DetectEquivalencesInElementConstraint(const ConstraintProto& ct,
   const IntegerVariable index = m->Integer(ct.element().index());
   const IntegerVariable target = m->Integer(ct.element().target());
   const std::vector<IntegerVariable> vars = m->Integers(ct.element().vars());
-
-  if (m->Get(IsFixed(index))) return;
+  CHECK(!m->Get(IsFixed(index)));
+  CHECK(!m->Get(IsFixed(target)));
 
   Domain union_of_non_constant_domains;
   std::map<IntegerValue, int> constant_to_num;
@@ -737,16 +736,24 @@ void DetectEquivalencesInElementConstraint(const ConstraintProto& ct,
 
   // Use the literal from the index encoding to encode the target at the
   // "unique" values.
+  bool is_one_to_one_mapping = true;
   for (const auto literal_value : m->Add(FullyEncodeVariable(index))) {
     const int i = literal_value.value.value();
-    if (!m->Get(IsFixed(vars[i]))) continue;
+    if (!m->Get(IsFixed(vars[i]))) {
+      is_one_to_one_mapping = false;
+      continue;
+    }
 
     const IntegerValue value(m->Get(Value(vars[i])));
     if (constant_to_num[value] == 1) {
       const Literal r = literal_value.literal;
       encoder->AssociateToIntegerEqualValue(r, target, value);
+    } else {
+      is_one_to_one_mapping = false;
     }
   }
+
+  return is_one_to_one_mapping;
 }
 
 // TODO(user): Be more efficient when the element().vars() are constants.
@@ -757,13 +764,7 @@ void LoadElementConstraintBounds(const ConstraintProto& ct,
   const IntegerVariable index = m->Integer(ct.element().index());
   const IntegerVariable target = m->Integer(ct.element().target());
   const std::vector<IntegerVariable> vars = m->Integers(ct.element().vars());
-
-  IntegerTrail* integer_trail = m->GetOrCreate<IntegerTrail>();
-  if (m->Get(IsFixed(index))) {
-    const int64 value = integer_trail->LowerBound(index).value();
-    m->Add(Equality(target, vars[value]));
-    return;
-  }
+  CHECK(!m->Get(IsFixed(index)));
 
   // We always fully encode the index on an element constraint.
   const auto encoding = m->Add(FullyEncodeVariable((index)));
@@ -789,7 +790,10 @@ void LoadElementConstraintBounds(const ConstraintProto& ct,
       m->Add(ConditionalLowerOrEqualWithOffset(target, vars[i], 0, r));
     }
   }
-  m->Add(PartialIsOneOfVar(target, possible_vars, selectors));
+
+  if (!m->Get(IsFixed(target))) {
+    m->Add(PartialIsOneOfVar(target, possible_vars, selectors));
+  }
 }
 
 // Arc-Consistent encoding of the element constraint as SAT clauses.
@@ -810,18 +814,9 @@ void LoadElementConstraintAC(const ConstraintProto& ct, ModelWithMapping* m) {
   const IntegerVariable index = m->Integer(ct.element().index());
   const IntegerVariable target = m->Integer(ct.element().target());
   const std::vector<IntegerVariable> vars = m->Integers(ct.element().vars());
+  CHECK(!m->Get(IsFixed(index)));
+  CHECK(!m->Get(IsFixed(target)));
 
-  IntegerTrail* integer_trail = m->GetOrCreate<IntegerTrail>();
-  if (m->Get(IsFixed(index))) {
-    const int64 value = integer_trail->LowerBound(index).value();
-    m->Add(Equality(target, vars[value]));
-    return;
-  }
-
-  // Make map target_value -> literal.
-  if (m->Get(IsFixed(target))) {
-    return LoadElementConstraintBounds(ct, m);
-  }
   absl::flat_hash_map<IntegerValue, Literal> target_map;
   const auto target_encoding = m->Add(FullyEncodeVariable(target));
   for (const auto literal_value : target_encoding) {
@@ -832,6 +827,7 @@ void LoadElementConstraintAC(const ConstraintProto& ct, ModelWithMapping* m) {
   // literals and store them by value in vectors.
   absl::flat_hash_map<IntegerValue, std::vector<Literal>> value_to_literals;
   const auto index_encoding = m->Add(FullyEncodeVariable(index));
+  IntegerTrail* integer_trail = m->GetOrCreate<IntegerTrail>();
   for (const auto literal_value : index_encoding) {
     const int i = literal_value.value.value();
     const Literal i_lit = literal_value.literal;
@@ -879,12 +875,29 @@ void LoadElementConstraintAC(const ConstraintProto& ct, ModelWithMapping* m) {
 }
 
 void LoadElementConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
-  IntegerEncoder* encoder = m->GetOrCreate<IntegerEncoder>();
+  const IntegerVariable index = m->Integer(ct.element().index());
+  const IntegerVariable target = m->Integer(ct.element().target());
+  const std::vector<IntegerVariable> vars = m->Integers(ct.element().vars());
 
-  const int target = ct.element().target();
-  const IntegerVariable target_var = m->Integer(target);
-  const bool target_is_AC = m->Get(IsFixed(target_var)) ||
-                            encoder->VariableIsFullyEncoded(target_var);
+  // Special case when index is fixed.
+  if (m->Get(IsFixed(index))) {
+    m->Add(Equality(target, vars[m->Get(Value(index))]));
+    return;
+  }
+
+  // Special case when target is fixed.
+  if (m->Get(IsFixed(target))) {
+    return LoadElementConstraintBounds(ct, m);
+  }
+
+  // This returns true if there is nothing else to do after the equivalences
+  // of the form (index literal <=> target_literal) have been added.
+  if (DetectEquivalencesInElementConstraint(ct, m)) {
+    return;
+  }
+
+  IntegerEncoder* encoder = m->GetOrCreate<IntegerEncoder>();
+  const bool target_is_AC = encoder->VariableIsFullyEncoded(target);
 
   int num_AC_variables = 0;
   const int num_vars = ct.element().vars().size();
@@ -895,7 +908,6 @@ void LoadElementConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
     if (is_full) num_AC_variables++;
   }
 
-  DetectEquivalencesInElementConstraint(ct, m);
   const SatParameters& params = *m->model()->GetOrCreate<SatParameters>();
   if (params.boolean_encoding_level() > 0 &&
       (target_is_AC || num_AC_variables >= num_vars - 1)) {

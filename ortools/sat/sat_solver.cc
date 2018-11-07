@@ -51,12 +51,14 @@ SatSolver::SatSolver(Model* model)
       problem_is_pure_sat_(true),
       drat_proof_handler_(nullptr),
       stats_("SatSolver") {
-  // TODO(user): move these 3 classes in the Model so that everyone can access
+  // TODO(user): move these 2 classes in the Model so that everyone can access
   // them if needed and we don't have the wiring here.
   trail_->RegisterPropagator(&clauses_propagator_);
   trail_->RegisterPropagator(&pb_constraints_);
   InitializePropagators();
-  SetParameters(*parameters_);
+
+  // TODO(user): use the model parameters directly in pb_constraints_.
+  pb_constraints_.SetParameters(*parameters_);
 }
 
 SatSolver::~SatSolver() { IF_STATS_ENABLED(LOG(INFO) << stats_.StatString()); }

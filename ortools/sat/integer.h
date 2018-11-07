@@ -140,9 +140,7 @@ inline std::ostream& operator<<(std::ostream& os, IntegerLiteral i_lit) {
 using InlinedIntegerLiteralVector = absl::InlinedVector<IntegerLiteral, 2>;
 
 // A singleton that holds the INITIAL integer variable domains.
-struct IntegerDomains
-    : public gtl::ITIVector<IntegerVariable,
-                            absl::InlinedVector<ClosedInterval, 1>> {
+struct IntegerDomains : public gtl::ITIVector<IntegerVariable, Domain> {
   explicit IntegerDomains(Model* model) {}
 };
 
@@ -435,7 +433,7 @@ class IntegerTrail : public SatPropagator {
 
   // Returns the initial domain of the given variable. Note that the min/max
   // are updated with level zero propagation, but not holes.
-  Domain InitialVariableDomain(IntegerVariable var) const;
+  const Domain& InitialVariableDomain(IntegerVariable var) const;
 
   // Takes the intersection with the current initial variable domain.
   //
