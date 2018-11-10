@@ -1,4 +1,4 @@
-// Copyright 2010-2017 Google
+// Copyright 2010-2018 Google LLC
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -136,12 +136,21 @@ IntegerEncoder::PartialDomainEncoding(IntegerVariable var) const {
   // too. Except for the min/max of the initial domain.
   if (var >= encoding_by_var_.size()) return encoding;
 
-  std::set<IntegerValue> possible_values;
-  possible_values.insert(IntegerValue((*domains_)[var].Min()));
-  possible_values.insert(IntegerValue((*domains_)[var].Max()));
-  for (const auto entry : encoding_by_var_[var]) {
-    possible_values.insert(entry.first);
+  std::vector<IntegerValue> possible_values;
+  {
+    const IntegerValue min_value((*domains_)[var].Min());
+    const IntegerValue max_value((*domains_)[var].Max());
+    possible_values.push_back(min_value);
+    for (const auto entry : encoding_by_var_[var]) {
+      if (entry.first >= max_value) break;
+      if (entry.first > min_value) {
+        possible_values.push_back(entry.first);
+      }
+    }
+    possible_values.push_back(max_value);
+    DCHECK(std::is_sorted(possible_values.begin(), possible_values.end()));
   }
+
   for (const IntegerValue value : possible_values) {
     const std::pair<IntegerVariable, IntegerValue> key{var, value};
     const auto it = equality_to_associated_literal_.find(key);
@@ -580,6 +589,8 @@ bool IntegerTrail::UpdateInitialDomain(IntegerVariable var, Domain domain) {
                 {}, {}));
 
   // Set to false excluded literals.
+  // TODO(user): This is only needed to propagate holes and is a bit slow, I am
+  // not sure it is worthwhile.
   int i = 0;
   int num_fixed = 0;
   const auto encoding = encoder_->PartialDomainEncoding(var);

@@ -1,4 +1,4 @@
-// Copyright 2010-2017 Google
+// Copyright 2010-2018 Google LLC
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -362,6 +362,9 @@ class IntegerEncoder {
   // We keep all the literals associated to an Integer variable in a map ordered
   // by bound (so we can properly add implications between the literals
   // corresponding to the same variable).
+  //
+  // TODO(user): Remove the entry no longer needed because of level zero
+  // propagations.
   gtl::ITIVector<IntegerVariable, std::map<IntegerValue, Literal>>
       encoding_by_var_;
 

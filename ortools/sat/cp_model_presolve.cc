@@ -1,4 +1,4 @@
-// Copyright 2010-2017 Google
+// Copyright 2010-2018 Google LLC
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -92,8 +92,9 @@ struct PresolveContext {
   }
 
   // Returns true if this ref only appear in one constraint.
-  bool IsUnique(int ref) const {
-    return var_to_constraints[PositiveRef(ref)].size() == 1;
+  bool VariableIsUniqueAndRemovable(int ref) const {
+    return var_to_constraints[PositiveRef(ref)].size() == 1 &&
+           !enumerate_all_solutions;
   }
 
   Domain DomainOf(int ref) const {
@@ -341,6 +342,10 @@ struct PresolveContext {
   // Initially false, and set to true on the first inconsistency.
   bool is_unsat = false;
 
+  // Indicate if we are enumerating all solutions. This disable some presolve
+  // rules.
+  bool enumerate_all_solutions = false;
+
   // Just used to display statistics on the presolve rules that were used.
   absl::flat_hash_map<std::string, int> stats_by_rule_name;
 
@@ -388,7 +393,7 @@ bool PresolveEnforcementLiteral(ConstraintProto* ct, PresolveContext* context) {
     if (context->LiteralIsFalse(literal)) {
       context->UpdateRuleStats("false enforcement literal");
       return RemoveConstraint(ct, context);
-    } else if (context->IsUnique(literal)) {
+    } else if (context->VariableIsUniqueAndRemovable(literal)) {
       // We can simply set it to false and ignore the constraint in this case.
       context->UpdateRuleStats("enforcement literal not used");
       context->SetLiteralToFalse(literal);
@@ -431,7 +436,7 @@ bool PresolveBoolOr(ConstraintProto* ct, PresolveContext* context) {
     // We can just set the variable to true in this case since it is not
     // used in any other constraint (note that we artifically bump the
     // objective var usage by 1).
-    if (context->IsUnique(literal)) {
+    if (context->VariableIsUniqueAndRemovable(literal)) {
       context->UpdateRuleStats("bool_or: singleton");
       context->SetLiteralToTrue(literal);
       return RemoveConstraint(ct, context);
@@ -504,7 +509,7 @@ bool PresolveBoolAnd(ConstraintProto* ct, PresolveContext* context) {
       changed = true;
       continue;
     }
-    if (context->IsUnique(literal)) {
+    if (context->VariableIsUniqueAndRemovable(literal)) {
       changed = true;
       context->SetLiteralToTrue(literal);
       continue;
@@ -853,7 +858,7 @@ bool PresolveLinear(ConstraintProto* ct, PresolveContext* context) {
       //
       // TODO(user): In some case, we could still remove var, but we also need
       // to not keep the affine relationship around in the constraint count.
-      if (context->IsUnique(var) &&
+      if (context->VariableIsUniqueAndRemovable(var) &&
           context->affine_relations.ClassSize(var) == 1) {
         bool success;
         const auto term_domain =
@@ -1331,8 +1336,8 @@ bool PresolveElement(ConstraintProto* ct, PresolveContext* context) {
     context->UpdateRuleStats("element: reduced target domain");
   }
 
-  const bool unique_index =
-      context->IsUnique(index_ref) || context->IsFixed(index_ref);
+  const bool unique_index = context->VariableIsUniqueAndRemovable(index_ref) ||
+                            context->IsFixed(index_ref);
   if (all_constants && unique_index) {
     // This constraint is just here to reduce the domain of the target! We can
     // add it to the mapping_model to reconstruct the index value during
@@ -1343,7 +1348,8 @@ bool PresolveElement(ConstraintProto* ct, PresolveContext* context) {
   }
 
   const bool unique_target =
-      context->IsUnique(target_ref) || context->IsFixed(target_ref);
+      context->VariableIsUniqueAndRemovable(target_ref) ||
+      context->IsFixed(target_ref);
   if (all_included_in_target_domain && unique_target) {
     context->UpdateRuleStats("element: trivial index domain reduction");
     *(context->mapping_model->add_constraints()) = *ct;
@@ -1919,7 +1925,9 @@ void Probe(TimeLimit* global_time_limit, PresolveContext* context) {
 }
 
 void PresolvePureSatPart(PresolveContext* context) {
-  if (context->is_unsat) return;
+  // TODO(user, lperron): Reenable some SAT presolve with
+  // enumerate_all_solutions set to true.
+  if (context->is_unsat || context->enumerate_all_solutions) return;
 
   const int num_variables = context->working_model->variables_size();
   SatPostsolver postsolver(num_variables);
@@ -2506,7 +2514,7 @@ void PresolveToFixPoint(PresolveContext* context) {
 }
 
 void RemoveUnusedEquivalentVariables(PresolveContext* context) {
-  if (context->is_unsat) return;
+  if (context->is_unsat || context->enumerate_all_solutions) return;
 
   // Remove all affine constraints (they will be re-added later if
   // needed) in the presolved model.
@@ -2595,6 +2603,10 @@ void PresolveCpModel(const PresolveOptions& options,
   PresolveContext context;
   context.working_model = presolved_model;
   context.mapping_model = mapping_model;
+  if (options.parameters != nullptr) {
+    context.enumerate_all_solutions =
+        options.parameters->enumerate_all_solutions();
+  }
 
   // We copy the search strategy to the mapping_model.
   for (const auto& decision_strategy : presolved_model->search_strategy()) {
@@ -2768,7 +2780,10 @@ void PresolveCpModel(const PresolveOptions& options,
   postsolve_mapping->clear();
   std::vector<int> mapping(presolved_model->variables_size(), -1);
   for (int i = 0; i < presolved_model->variables_size(); ++i) {
-    if (context.var_to_constraints[i].empty()) continue;
+    if (context.var_to_constraints[i].empty() &&
+        !context.enumerate_all_solutions) {
+      continue;
+    }
     mapping[i] = postsolve_mapping->size();
     postsolve_mapping->push_back(i);
   }

@@ -1,4 +1,4 @@
-// Copyright 2010-2017 Google
+// Copyright 2010-2018 Google LLC
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -921,6 +921,22 @@ inline std::function<void(Model*)> ReifiedBoolOr(
     // All false => r false.
     clause.push_back(r.Negated());
     model->Add(ClauseConstraint(clause));
+  };
+}
+
+// enforcement_literals => clause.
+inline std::function<void(Model*)> EnforcedClause(
+    absl::Span<const Literal> enforcement_literals,
+    absl::Span<const Literal> clause) {
+  return [=](Model* model) {
+    std::vector<Literal> tmp;
+    for (const Literal l : enforcement_literals) {
+      tmp.push_back(l.Negated());
+    }
+    for (const Literal l : clause) {
+      tmp.push_back(l);
+    }
+    model->Add(ClauseConstraint(tmp));
   };
 }
 

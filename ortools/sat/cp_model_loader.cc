@@ -1,4 +1,4 @@
-// Copyright 2010-2017 Google
+// Copyright 2010-2018 Google LLC
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -548,9 +548,66 @@ void LoadBoolXorConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
   m->Add(LiteralXorIs(m->Literals(ct.bool_xor().literals()), true));
 }
 
+namespace {
+
+// Boolean encoding of:
+// enforcement_literal => coeff1 * var1 + coeff2 * var2 == rhs;
+void LoadEquivalenceAC(const std::vector<Literal> enforcement_literal,
+                       IntegerValue coeff1, IntegerVariable var1,
+                       IntegerValue coeff2, IntegerVariable var2,
+                       const IntegerValue rhs, ModelWithMapping* m) {
+  auto* encoder = m->GetOrCreate<IntegerEncoder>();
+  CHECK(encoder->VariableIsFullyEncoded(var1));
+  CHECK(encoder->VariableIsFullyEncoded(var2));
+  absl::flat_hash_map<IntegerValue, Literal> term1_value_to_literal;
+  for (const auto value_literal : encoder->FullDomainEncoding(var1)) {
+    term1_value_to_literal[coeff1 * value_literal.value] =
+        value_literal.literal;
+  }
+  for (const auto value_literal : encoder->FullDomainEncoding(var2)) {
+    const IntegerValue target = rhs - value_literal.value * coeff2;
+    if (!gtl::ContainsKey(term1_value_to_literal, target)) {
+      m->Add(EnforcedClause(enforcement_literal,
+                            {value_literal.literal.Negated()}));
+    } else {
+      const Literal target_literal = term1_value_to_literal[target];
+      m->Add(EnforcedClause(enforcement_literal,
+                            {value_literal.literal.Negated(), target_literal}));
+      m->Add(EnforcedClause(enforcement_literal,
+                            {value_literal.literal, target_literal.Negated()}));
+
+      // This "target" can never be reached again, so it is safe to remove it.
+      // We do that so we know the term1 values that are never reached.
+      term1_value_to_literal.erase(target);
+    }
+  }
+
+  // Exclude the values that can never be "matched" by coeff2 * var2.
+  for (const auto entry : term1_value_to_literal) {
+    m->Add(EnforcedClause(enforcement_literal, {entry.second.Negated()}));
+  }
+}
+
+}  // namespace
+
 void LoadLinearConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
   const std::vector<IntegerVariable> vars = m->Integers(ct.linear().vars());
   const std::vector<int64> coeffs = ValuesFromProto(ct.linear().coeffs());
+
+  const SatParameters& params = *m->model()->GetOrCreate<SatParameters>();
+  if (params.boolean_encoding_level() > 0 && vars.size() == 2 &&
+      ct.linear().domain_size() == 2 &&
+      ct.linear().domain(0) == ct.linear().domain(1)) {
+    auto* encoder = m->GetOrCreate<IntegerEncoder>();
+    if (encoder->VariableIsFullyEncoded(vars[0]) &&
+        encoder->VariableIsFullyEncoded(vars[1])) {
+      return LoadEquivalenceAC(m->Literals(ct.enforcement_literal()),
+                               IntegerValue(coeffs[0]), vars[0],
+                               IntegerValue(coeffs[1]), vars[1],
+                               IntegerValue(ct.linear().domain(0)), m);
+    }
+  }
+
   if (ct.linear().domain_size() == 2) {
     const int64 lb = ct.linear().domain(0);
     const int64 ub = ct.linear().domain(1);
@@ -772,8 +829,8 @@ void LoadElementConstraintBounds(const ConstraintProto& ct,
   std::vector<IntegerVariable> possible_vars;
   for (const auto literal_value : encoding) {
     const int i = literal_value.value.value();
-    CHECK_GE(i, 0) << "Should be presolved.";
-    CHECK_LT(i, vars.size()) << "Should be presolved.";
+    CHECK_GE(i, 0);
+    CHECK_LT(i, vars.size());
     possible_vars.push_back(vars[i]);
     selectors.push_back(literal_value.literal);
     const Literal r = literal_value.literal;
@@ -874,10 +931,50 @@ void LoadElementConstraintAC(const ConstraintProto& ct, ModelWithMapping* m) {
   }
 }
 
+namespace {
+
+// This Boolean encoding is enough for consistency, but does not propagate as
+// much as LoadElementConstraintAC(). However, setting any of the non-propagated
+// Booleans to its "wrong" value will result directly in a conflict, so the
+// solver will easily learn an AC encoding...
+//
+// The advantage is that this does not introduce extra BooleanVariables.
+void LoadElementConstraintHalfAC(const ConstraintProto& ct,
+                                 ModelWithMapping* m) {
+  const IntegerVariable index = m->Integer(ct.element().index());
+  const IntegerVariable target = m->Integer(ct.element().target());
+  const std::vector<IntegerVariable> vars = m->Integers(ct.element().vars());
+  CHECK(!m->Get(IsFixed(index)));
+  CHECK(!m->Get(IsFixed(target)));
+
+  m->Add(FullyEncodeVariable(target));
+  for (const auto value_literal : m->Add(FullyEncodeVariable(index))) {
+    const int i = value_literal.value.value();
+    m->Add(FullyEncodeVariable(vars[i]));
+    LoadEquivalenceAC({value_literal.literal}, IntegerValue(1), vars[i],
+                      IntegerValue(-1), target, IntegerValue(0), m);
+  }
+}
+
+}  // namespace
+
 void LoadElementConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
   const IntegerVariable index = m->Integer(ct.element().index());
   const IntegerVariable target = m->Integer(ct.element().target());
   const std::vector<IntegerVariable> vars = m->Integers(ct.element().vars());
+
+  // Retrict the domain of index in case there was no presolve.
+  if (!m->GetOrCreate<IntegerTrail>()->UpdateInitialDomain(
+          index, Domain(0, vars.size() - 1))) {
+    return;
+  }
+
+  // This returns true if there is nothing else to do after the equivalences
+  // of the form (index literal <=> target_literal) have been added.
+  if (!m->Get(IsFixed(index)) && !m->Get(IsFixed(target)) &&
+      DetectEquivalencesInElementConstraint(ct, m)) {
+    return;
+  }
 
   // Special case when index is fixed.
   if (m->Get(IsFixed(index))) {
@@ -888,12 +985,6 @@ void LoadElementConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
   // Special case when target is fixed.
   if (m->Get(IsFixed(target))) {
     return LoadElementConstraintBounds(ct, m);
-  }
-
-  // This returns true if there is nothing else to do after the equivalences
-  // of the form (index literal <=> target_literal) have been added.
-  if (DetectEquivalencesInElementConstraint(ct, m)) {
-    return;
   }
 
   IntegerEncoder* encoder = m->GetOrCreate<IntegerEncoder>();
@@ -911,7 +1002,11 @@ void LoadElementConstraint(const ConstraintProto& ct, ModelWithMapping* m) {
   const SatParameters& params = *m->model()->GetOrCreate<SatParameters>();
   if (params.boolean_encoding_level() > 0 &&
       (target_is_AC || num_AC_variables >= num_vars - 1)) {
-    LoadElementConstraintAC(ct, m);
+    if (params.boolean_encoding_level() > 1) {
+      LoadElementConstraintAC(ct, m);
+    } else {
+      LoadElementConstraintHalfAC(ct, m);
+    }
   } else {
     LoadElementConstraintBounds(ct, m);
   }
