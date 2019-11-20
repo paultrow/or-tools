@@ -23,7 +23,6 @@ from ortools.linear_solver import pywraplp
 def create_data_model():
     """Stores the data for the problem."""
     data = {}
-    # Locations in block units
     data['constraint_coeffs'] = [
         [5, 7, 9, 2, 1],
         [18, 4, -9, 10, 12],
